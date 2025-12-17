@@ -1,13 +1,30 @@
 'use client';
 
-import { useState, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { AuroraBackground } from '@/components/ui/aurora-background';
 
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [progressLabel, setProgressLabel] = useState<string>('');
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const eventSourceRef = useRef<EventSource | null>(null);
+
+  const closeEventSource = () => {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      closeEventSource();
+    };
+  }, []);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
@@ -51,23 +68,84 @@ export default function Home() {
     setLoading(true);
     setError(null);
     setSuccess(false);
+    setProgress(1);
+    setProgressLabel('Iniciando...');
+    closeEventSource();
 
     try {
       const formData = new FormData();
       formData.append('file', file);
 
-      const response = await fetch('/api/convert', {
+      setProgressLabel('Enviando arquivo...');
+      const startResponse = await fetch('/api/convert/start', {
         method: 'POST',
         body: formData,
       });
 
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || 'Erro ao processar o arquivo');
+      if (!startResponse.ok) {
+        const errorData = await startResponse.json();
+        throw new Error(errorData.error || 'Erro ao iniciar o processamento');
+      }
+
+      const startData = (await startResponse.json()) as { jobId?: string };
+      const jobId = startData.jobId;
+      if (!jobId) {
+        throw new Error('Não foi possível iniciar o job (jobId ausente)');
+      }
+
+      setProgressLabel('Processando...');
+
+      await new Promise<void>((resolve, reject) => {
+        const es = new EventSource(`/api/convert/progress?jobId=${encodeURIComponent(jobId)}`);
+        eventSourceRef.current = es;
+
+        const onError = () => {
+          closeEventSource();
+          reject(new Error('Conexão perdida ao acompanhar o progresso'));
+        };
+
+        es.addEventListener('error', onError);
+
+        es.addEventListener('progress', (evt) => {
+          try {
+            const data = JSON.parse((evt as MessageEvent).data) as {
+              status: 'queued' | 'processing' | 'done' | 'error';
+              progress: number;
+              message: string;
+              error: string | null;
+            };
+
+            setProgress(typeof data.progress === 'number' ? data.progress : 0);
+            setProgressLabel(data.message || 'Processando...');
+
+            if (data.status === 'done') {
+              closeEventSource();
+              resolve();
+            }
+
+            if (data.status === 'error') {
+              closeEventSource();
+              reject(new Error(data.error || 'Erro ao processar o arquivo'));
+            }
+          } catch {
+            closeEventSource();
+            reject(new Error('Resposta inválida do servidor durante o progresso'));
+          }
+        });
+      });
+
+      setProgress(95);
+      setProgressLabel('Baixando arquivo Excel...');
+
+      const downloadResponse = await fetch(`/api/convert/download?jobId=${encodeURIComponent(jobId)}`);
+
+      if (!downloadResponse.ok) {
+        const errorData = await downloadResponse.json().catch(() => null);
+        throw new Error(errorData?.error || 'Erro ao baixar o arquivo');
       }
 
       // Criar download do arquivo Excel
-      const blob = await response.blob();
+      const blob = await downloadResponse.blob();
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -77,6 +155,9 @@ export default function Home() {
       window.URL.revokeObjectURL(url);
       document.body.removeChild(a);
 
+      setProgress(100);
+      setProgressLabel('Concluído');
+
       setSuccess(true);
       setFile(null);
       if (fileInputRef.current) {
@@ -85,27 +166,33 @@ export default function Home() {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Erro ao processar o arquivo');
     } finally {
+      closeEventSource();
       setLoading(false);
+      setProgress(0);
+      setProgressLabel('');
     }
   };
 
   const handleReset = () => {
+    closeEventSource();
     setFile(null);
     setError(null);
     setSuccess(false);
+    setProgress(0);
+    setProgressLabel('');
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-gradient-to-br from-blue-50 to-indigo-100 p-4 dark:from-gray-900 dark:to-gray-800">
-      <main className="w-full max-w-xl rounded-2xl bg-white p-8 shadow-xl dark:bg-gray-800">
+    <AuroraBackground className="p-4">
+      <main className="w-full max-w-xl rounded-2xl border border-white/20 bg-white/10 p-8 shadow-2xl backdrop-blur-2xl dark:border-white/10 dark:bg-gray-900/30 dark:shadow-2xl">
         {/* Header */}
         <div className="mb-8 text-center">
-          <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-blue-100 dark:bg-blue-900">
+          <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-gray-200 dark:bg-gray-800">
             <svg
-              className="h-8 w-8 text-blue-600 dark:text-blue-400"
+              className="h-8 w-8 text-gray-600 dark:text-gray-300"
               fill="none"
               stroke="currentColor"
               viewBox="0 0 24 24"
@@ -133,8 +220,8 @@ export default function Home() {
           onClick={() => fileInputRef.current?.click()}
           className={`cursor-pointer rounded-xl border-2 border-dashed p-8 text-center transition-all ${
             file
-              ? 'border-green-400 bg-green-50 dark:border-green-600 dark:bg-green-900/20'
-              : 'border-gray-300 bg-gray-50 hover:border-blue-400 hover:bg-blue-50 dark:border-gray-600 dark:bg-gray-700 dark:hover:border-blue-500 dark:hover:bg-gray-600'
+              ? 'border-gray-400 bg-gray-100 dark:border-gray-500 dark:bg-gray-800/40'
+              : 'border-gray-300 bg-gray-50 hover:border-gray-400 hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-700 dark:hover:border-gray-500 dark:hover:bg-gray-600'
           }`}
         >
           <input
@@ -147,9 +234,9 @@ export default function Home() {
 
           {file ? (
             <div className="space-y-2">
-              <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-green-100 dark:bg-green-800">
+              <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-gray-200 dark:bg-gray-700">
                 <svg
-                  className="h-6 w-6 text-green-600 dark:text-green-400"
+                  className="h-6 w-6 text-gray-600 dark:text-gray-300"
                   fill="none"
                   stroke="currentColor"
                   viewBox="0 0 24 24"
@@ -218,6 +305,32 @@ export default function Home() {
           </div>
         )}
 
+        {/* Progress */}
+        {loading && (
+          <div className="mt-4">
+            <div className="mb-2 flex items-center justify-between text-sm">
+              <span className="text-gray-700 dark:text-gray-300">
+                {progressLabel || 'Processando...'}
+              </span>
+              <span className="font-medium text-gray-700 dark:text-gray-300">
+                {progress}%
+              </span>
+            </div>
+            <div
+              className="h-2 w-full overflow-hidden rounded-full bg-gray-200 dark:bg-gray-600"
+              role="progressbar"
+              aria-valuenow={progress}
+              aria-valuemin={0}
+              aria-valuemax={100}
+            >
+              <div
+                className="h-full rounded-full bg-blue-600 transition-all duration-300 dark:bg-blue-500"
+                style={{ width: `${progress}%` }}
+              />
+            </div>
+          </div>
+        )}
+
         {/* Success Message */}
         {success && (
           <div className="mt-4 rounded-lg bg-green-50 p-4 dark:bg-green-900/20">
@@ -258,8 +371,8 @@ export default function Home() {
             disabled={!file || loading}
             className={`flex-1 rounded-lg px-4 py-3 font-medium text-white transition-all ${
               !file || loading
-                ? 'cursor-not-allowed bg-gray-400'
-                : 'bg-blue-600 hover:bg-blue-700 active:scale-[0.98]'
+                ? 'cursor-not-allowed bg-gray-500'
+                : 'bg-gray-600 hover:bg-gray-700 active:scale-[0.98]'
             }`}
           >
             {loading ? (
@@ -290,28 +403,7 @@ export default function Home() {
             )}
           </button>
         </div>
-
-        {/* Info */}
-        <div className="mt-8 rounded-lg bg-gray-50 p-4 dark:bg-gray-700">
-          <h3 className="mb-2 font-medium text-gray-900 dark:text-white">
-            Como funciona:
-          </h3>
-          <ul className="space-y-1 text-sm text-gray-600 dark:text-gray-400">
-            <li className="flex items-start gap-2">
-              <span className="mt-1 text-blue-500">1.</span>
-              Faça upload de um arquivo PDF contendo tabelas
-            </li>
-            <li className="flex items-start gap-2">
-              <span className="mt-1 text-blue-500">2.</span>
-              As tabelas são detectadas automaticamente em todas as páginas
-            </li>
-            <li className="flex items-start gap-2">
-              <span className="mt-1 text-blue-500">3.</span>
-              Um arquivo Excel formatado é gerado para download
-            </li>
-          </ul>
-        </div>
       </main>
-    </div>
+    </AuroraBackground>
   );
 }
